@@ -4,27 +4,55 @@ Every path is resolved relative to this file, so scripts and notebooks work
 no matter which directory they are started from.
 """
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
+# ---------------------------------------------------------------------------
+# Feature extraction (STFT and MFCC)
+# ---------------------------------------------------------------------------
+# FFT size per frame. Must be a power of two for `feature_extraction.fft`.
 N_FFT: int = 2_048
+# Hann window length; frames shorter than N_FFT are zero-padded up to it.
 WINDOW_LENGTH: int = 2_048
+# Samples between the starts of two consecutive frames.
 HOP_LENGTH: int = 512
+N_MFCC: int = 13 # Number of MFCC coefficients kept per frame (the `mfcc` default).
 
 # ---------------------------------------------------------------------------
 # Audio and dataset
 # ---------------------------------------------------------------------------
+# Every clip is loaded (and resampled if needed) at this rate, in mono.
 SAMPLE_RATE: int = 44_100
 N_CHANNEL: int = 1
+# Seed for the train / test split, the augmentations and the CV folds.
 SEED: int = 42
 
+# Share of the clips in each split (stratified by class).
 TRAIN_SIZE: float = 0.8
 TEST_SIZE: float = 0.2
 
+# Class names, as they appear in the file names (see `preprocessing.parse_label`).
 LABEL: List[str] = ["daluo", "bangu", "xiaoluo", "naobo"]
+
+# ---------------------------------------------------------------------------
+# Clip duration
+# ---------------------------------------------------------------------------
+# Every clip is trimmed of leading / trailing silence and then cut to at
+# most this many seconds (see `preprocessing.clip_duration`). Shorter clips
+# are kept as they are, never padded.
+#
+# DURATIONS are the caps compared by `evaluation.search_best_duration`.
+# MAX_DURATION is the cap picked from that search. It is the default cap of
+# `preprocessing.clip_all`; `prepare_data` only clips when it is given a
+# `max_duration`, e.g. ``prepare_data(max_duration=MAX_DURATION)``.
+DURATIONS: List[float] = [0.5, 1.0, 1.5, 2.0, 2.5]
+MAX_DURATION: float | None = 2.0
 
 # ---------------------------------------------------------------------------
 # Augmentation settings
 # ---------------------------------------------------------------------------
+
+AUGMENTATION_NAMES: Tuple[str, ...] = ("noise", "mp3", "downsample")
+
 # Number of noise / MP3 copies made from every training clip. Each copy uses
 # a different value drawn from the TRAIN_* range below.
 N_AUG_COPIES: int = 3
