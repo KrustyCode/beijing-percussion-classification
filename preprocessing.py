@@ -8,17 +8,36 @@ Pipeline (run with ``python preprocessing.py`` or call `prepare_data`):
        there. Pass ``resplit=True`` to make a new split on purpose.
     3. Write augmented copies of each split to its own folder. The original
        dataset is never modified.
-    4. Write a manifest CSV that lists every original and augmented file.
-    5. Return train and test, each separated per augmentation::
+    4. Optionally (``max_duration`` given) trim the silence from every clip
+       and cut it to at most ``max_duration`` seconds, see `clip_datasets`.
+       This only changes the returned signals; the files on disk and the
+       manifest keep the full-length audio.
+    5. Write a manifest CSV that lists every original and augmented file.
+    6. Return train and test, each separated per augmentation. Test copies
+       are also separated per augmentation value, because every test clip
+       gets the same fixed values (e.g. one Dataset per SNR in TEST_SNR)::
 
         train, test = prepare_data()
         train["original"], train["noise"], train["mp3"], train["downsample"]
         train_all = merge_datasets(*train.values())
 
+        test["original"]                  # clean test clips
+        test["noise"][30], test["noise"][0]        # one Dataset per TEST_SNR
+        test["mp3"][2], test["downsample"][8000]   # per TEST_COMPRESSION / DOWN_SR
+
+    Train copies stay one Dataset per augmentation: their values are drawn
+    at random per clip, so they do not form fixed levels.
+
 Loading the prepared data later (no re-splitting, no re-augmenting)::
 
     train = load_split("train", augmentations=["noise", "mp3", "downsample"])
     test_noisy = load_split("test", augmentations=["noise"], include_original=False)
+    test_noisy.by_param()                 # {30: Dataset, 20: Dataset, ...}
+
+`load_split` returns the full-length clips from disk. To trim and clip
+them like ``prepare_data(max_duration=...)`` does, use `clip_all` on a
+Dataset's signals, or `clip_datasets` on the whole ``{"train": ..., "test": ...}``
+dict.
 
 Augmentations (settings live in config.py):
     noise       Additive white Gaussian noise at a given SNR (dB).
@@ -81,10 +100,11 @@ from config import (
     NOISE_FOLDER_PATH, MP3_FOLDER_PATH, DOWNSAMPLE_FOLDER_PATH,
     MANIFEST_PATH,
     SCALER_PATH,
+    AUGMENTATION_NAMES,
+    MAX_DURATION
 )
 
 SPLITS: Tuple[str, str] = ("train", "test")
-
 
 @dataclass
 class Dataset:
@@ -98,11 +118,19 @@ class Dataset:
         sources: Name of the original clip each clip comes from (equal to
             `names` for originals). Use it as the group in group-aware
             cross-validation, so a clip and its copies stay together.
+        params: Augmentation value of each clip: the SNR in dB for noise,
+            the VBR quality for mp3, the sample rate for downsample, and
+            ``None`` for originals. Filled with ``None`` if not given.
     """
     signals: List[np.ndarray] = field(default_factory=list)
     labels: List[str] = field(default_factory=list)
     names: List[str] = field(default_factory=list)
     sources: List[str] = field(default_factory=list)
+    params: List[int | None] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.params:
+            self.params = [None] * len(self.signals)
 
     def __len__(self) -> int:
         return len(self.signals)
@@ -110,7 +138,20 @@ class Dataset:
     def subset(self, indices: Sequence[int]) -> "Dataset":
         """Return a new Dataset with only the clips at `indices`, in that order."""
         return Dataset([self.signals[i] for i in indices], [self.labels[i] for i in indices],
-                       [self.names[i] for i in indices], [self.sources[i] for i in indices])
+                       [self.names[i] for i in indices], [self.sources[i] for i in indices],
+                       [self.params[i] for i in indices])
+
+    def by_param(self) -> Dict[int | None, "Dataset"]:
+        """Split the clips by augmentation value, e.g. one Dataset per test SNR.
+
+        Returns:
+            Dict from value to the clips with that value, in the order the
+            values first appear (for test copies: the order in config.py).
+        """
+        indices: Dict[int | None, List[int]] = {}
+        for i, param in enumerate(self.params):
+            indices.setdefault(param, []).append(i)
+        return {param: self.subset(idx) for param, idx in indices.items()}
 
 
 def merge_datasets(*datasets: Dataset) -> Dataset:
@@ -127,6 +168,7 @@ def merge_datasets(*datasets: Dataset) -> Dataset:
         merged.labels.extend(data.labels)
         merged.names.extend(data.names)
         merged.sources.extend(data.sources)
+        merged.params.extend(data.params)
     return merged
 
 
@@ -196,8 +238,8 @@ def load_dataset(folder: Path = FOLDER_PATH) -> Dataset:
         data.labels.append(parse_label(f))
         data.names.append(f.stem)
         data.sources.append(f.stem)
+        data.params.append(None)
     return data
-
 
 # ---------------------------------------------------------------------------
 # Signal cleaning
@@ -221,18 +263,116 @@ def duration_standardization(
 ) -> np.ndarray:
     """Cut or zero-pad a signal to exactly `duration` seconds.
 
+    Longer signals lose their end; shorter ones get zeros appended at the
+    end. Not used by the pipeline, which uses `clip_duration` instead, so
+    short clips are never padded with silence.
+
     Args:
         signal: Mono signal.
         sample_rate: Sample rate of `signal` in Hz.
-        duration: Target length in seconds. ``None`` returns `signal` unchanged.
+        duration: Target length in seconds.
 
     Returns:
         Array of shape ``(round(sample_rate * duration),)``.
+
+    Raises:
+        ValueError: If `duration` is ``None``.
     """
     if duration is None:
-        return signal
+        raise ValueError("Forget to give target duration")
     n_samples = int(round(sample_rate * duration))
     return lb.util.fix_length(signal, size=n_samples)
+
+
+def clip_duration(signal: np.ndarray, sample_rate: int = SAMPLE_RATE, max_duration: float | None = None
+                  )-> np.ndarray:
+    """Trim the silence from a signal, then cut it to at most `max_duration` seconds.
+
+    Trimming first means the cut counts from the start of the sound, not
+    from the start of the file. Only the end is cut, and shorter signals
+    are returned as they are (never padded), so the frame-wise features
+    are not filled with silent frames.
+
+    Args:
+        signal: Mono signal.
+        sample_rate: Sample rate of `signal` in Hz.
+        max_duration: Longest length to keep, in seconds.
+
+    Returns:
+        The trimmed signal, at most ``round(sample_rate * max_duration)``
+        samples long.
+
+    Raises:
+        ValueError: If `max_duration` is ``None``.
+    """
+    if max_duration is None:
+        raise ValueError("Forget to give max duration")
+    signal = trim_silence(signal)
+
+    n_target_samples = int(round(sample_rate * max_duration))
+    if len(signal) > n_target_samples:
+        return signal[:n_target_samples]
+    
+    return signal
+
+
+def clip_all(data_sequence: List, sample_rate: int = SAMPLE_RATE, max_duration: float = MAX_DURATION) -> List:
+    """Apply `clip_duration` to every signal in a list.
+
+    The input list is not changed. The result stays a list, not one array,
+    because the clips have different lengths after trimming.
+
+    Example::
+
+        clipped = Dataset(clip_all(data.signals, max_duration=1.0),
+                          data.labels, data.names, data.sources, data.params)
+
+    Args:
+        data_sequence: Mono signals, e.g. ``Dataset.signals``.
+        sample_rate: Sample rate of the signals in Hz.
+        max_duration: Longest length to keep, in seconds. Defaults to
+            ``MAX_DURATION`` from config.py.
+
+    Returns:
+        The trimmed and clipped signals, in the same order.
+
+    Raises:
+        ValueError: If `max_duration` is ``None``.
+    """
+    return [clip_duration(s, sample_rate, max_duration=max_duration) for s in data_sequence]
+
+
+def clip_datasets(datasets: dict, max_duration: float) -> dict:
+    """Trim and clip every clip of both splits, in place (see `clip_all`).
+
+    Changes the Datasets inside `datasets` directly. Calling it twice on
+    the same data clips the already-clipped signals again, so to compare
+    several durations, load the data again for each one (or build new
+    Datasets with `clip_all`, as `evaluation.search_best_duration` does).
+
+    Args:
+        datasets: ``{"train": {...}, "test": {...}}`` as `prepare_data`
+            builds it: each split maps ``"original"`` and every name in
+            ``AUGMENTATION_NAMES`` to a Dataset, or, for test copies, to a
+            dict ``{level: Dataset}``.
+        max_duration: Longest length to keep, in seconds.
+
+    Returns:
+        The same `datasets` dict, with clipped signals.
+
+    Raises:
+        KeyError: If a split is missing ``"original"`` or one of
+            ``AUGMENTATION_NAMES``.
+    """
+    for split in SPLITS:
+        datasets[split]["original"].signals = clip_all(data_sequence=datasets[split]["original"].signals, max_duration=max_duration)
+        for name in AUGMENTATION_NAMES:
+            sets = datasets[split][name]
+            # train: one Dataset; test: {level: Dataset}
+            for dataset in (sets.values() if isinstance(sets, dict) else [sets]):
+                dataset.signals = clip_all(dataset.signals, max_duration=max_duration)
+
+    return datasets
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +575,7 @@ def augment_split(
             copies.labels.append(label)
             copies.names.append(path.stem)
             copies.sources.append(name)
+            copies.params.append(param)
             rows.append({"path": _manifest_path(path), "label": label, "source": name,
                          "split": split, "augmentation": augmentation.name, "param": str(param)})
     return copies, rows
@@ -611,7 +752,9 @@ def load_split(
         split_path: Split file, used to check the manifest is up to date.
 
     Returns:
-        The clips; `Dataset.sources` names the original of each copy.
+        The clips; `Dataset.sources` names the original of each copy and
+        `Dataset.params` its augmentation value. Call `Dataset.by_param` to
+        separate test copies per level.
 
     Raises:
         FileNotFoundError: If the manifest does not exist yet.
@@ -650,6 +793,7 @@ def load_split(
         data.labels.append(row["label"])
         data.names.append(path.stem)
         data.sources.append(row["source"])
+        data.params.append(int(row["param"]) if row["param"] else None)
     return data
 
 
@@ -732,7 +876,8 @@ def prepare_data(
         manifest_path: Path = MANIFEST_PATH,
         split_path: Path = SPLIT_PATH,
         resplit: bool = False,
-) -> Tuple[Dict[str, Dataset], Dict[str, Dataset]]:
+        max_duration: float | None = None
+) -> Tuple[Dict[str, Dataset], Dict[str, Union[Dataset, Dict[int, Dataset]]]]:
     """Load, split and augment the dataset, then write the manifest.
 
     Args:
@@ -741,6 +886,11 @@ def prepare_data(
         manifest_path: Where to write the manifest CSV.
         split_path: Saved split to reuse, or to create if it does not exist.
         resplit: Make and save a new split even if `split_path` exists.
+        max_duration: If given, trim and clip every returned clip to at
+            most this many seconds with `clip_datasets`, after the copies
+            are written. ``None`` keeps the full clips. The files on disk
+            are never clipped. Needs `augmentations` to cover every name in
+            ``AUGMENTATION_NAMES``.
 
     Returns:
         ``(train, test)``, each a dict from augmentation name to its clips::
@@ -750,13 +900,23 @@ def prepare_data(
             train["mp3"]
             train["downsample"]
 
-        Use `merge_datasets` to combine several of them into one training
-        set. All signals are at ``SAMPLE_RATE``.
+            test["original"]     # un-augmented clips
+            test["noise"]        # dict per level: {30: Dataset, 20: Dataset, ...}
+            test["mp3"]          # {2: Dataset, 5: Dataset, 9: Dataset}
+            test["downsample"]   # {22050: Dataset, 16000: Dataset, 8000: Dataset}
+
+        Test copies are split per level so a model can be scored on each one
+        separately. Use `merge_datasets` to combine several training sets
+        into one. All signals are at ``SAMPLE_RATE``.
+
+    Note:
+        With `max_duration`, the copies are made from the full-length
+        originals and trimmed afterwards. Noise raises the silence floor,
+        so noisy copies lose less to `trim_silence` than their originals.
     """
     # 1. LOAD AND SPLIT
     original = dict(zip(SPLITS, split_data(load_dataset(folder), split_path, resplit)))
-    result: Dict[str, Dict[str, Dataset]] = {split: {"original": original[split]}
-                                             for split in SPLITS}
+    result: Dict[str, Dict] = {split: {"original": original[split]} for split in SPLITS}
 
     rows = [{"path": _manifest_path(Path(folder) / f"{name}.wav"), "label": label,
              "source": name, "split": split, "augmentation": "original", "param": ""}
@@ -768,10 +928,15 @@ def prepare_data(
     for augmentation in augmentations:
         for split in SPLITS:
             copies, aug_rows = augment_split(original[split], split, augmentation, rng)
-            result[split][augmentation.name] = copies
+            # Test levels are fixed (e.g. every TEST_SNR), so keep them apart
+            result[split][augmentation.name] = copies.by_param() if split == "test" else copies
             rows.extend(aug_rows)
 
-    # 3. MANIFEST
+    # 3. TRIM AND CLIP EACH SPLIT (in memory only)
+    if not max_duration is None:
+        result = clip_datasets(result, max_duration)
+
+    # 4. MANIFEST
     write_manifest(rows, manifest_path)
     print(f"Wrote {len(rows)} entries to {manifest_path}")
 
