@@ -1,3 +1,29 @@
+"""Audio features for the percussion classifiers, written from scratch with NumPy.
+
+Every clip becomes one fixed-length vector (see `feature_names`):
+
+    mfcc       13 mel-frequency cepstral coefficients: the spectral envelope.
+    flatness   Spectral flatness over the whole spectrum: noise-like (1)
+               versus tonal (0).
+    contrast   Spectral contrast per octave band (8 bands at 44.1 kHz): how
+               far the peaks stand out above the valleys.
+
+Each of them is computed per STFT frame and summarized by its mean and
+standard deviation over time, so clips of any length give vectors of the
+same size. The STFT settings come from config.py (``N_FFT``,
+``WINDOW_LENGTH``, ``HOP_LENGTH``).
+
+Typical use::
+
+    original, noise, mp3, downsample = run_extraction()
+    model.fit(original["train"].X, original["train"].labels)
+
+    features = extract_all_features(dataset)    # one Dataset -> Features
+
+Building blocks, from low to high level: `fft` (radix-2), `stft`,
+`mel_filterbank`, `mel_spectrogram`, `dct`, `mfcc`, `spectral_flatness`
+and `spectral_contrast`.
+"""
 from functools import lru_cache
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
@@ -10,10 +36,10 @@ from config import (
     N_FFT,
     HOP_LENGTH,
     WINDOW_LENGTH,
+    N_MFCC,
+    AUGMENTATION_NAMES
 )
 
-# Number of MFCC coefficients kept per frame (the `mfcc` default).
-N_MFCC: int = 13
 
 
 @dataclass
@@ -30,12 +56,15 @@ class Features:
         sources: Original clip each row comes from. Use it as the group in
             group-aware cross-validation, so a clip and its augmented copies
             stay on the same side of a fold.
+        params: Augmentation value of each row (SNR, MP3 quality or sample
+            rate), ``None`` for originals.
         feature_names: Name of each column of `X`, e.g. ``"mfcc_mean_0"``.
     """
     X: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
     labels: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=str))
     names: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=str))
     sources: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=str))
+    params: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=object))
     feature_names: List[str] = field(default_factory=list)
 
     def __len__(self) -> int:
@@ -87,6 +116,20 @@ def complex_to_db(x: np.ndarray, ref: float | None = None) -> np.ndarray:
     return 10 * np.log10(np.maximum(power, 1e-10) / ref)
 
 def magnitude_to_db(x: np.ndarray, ref: float | None = None) -> np.ndarray:
+    """Convert a magnitude array to a decibel-scaled power array.
+
+    Squares `x` and converts it like `power_to_db`, so the result is
+    ``20 * log10(|x|)`` relative to the reference.
+
+    Args:
+        x: Non-negative magnitudes of any shape.
+        ref: Reference power that maps to 0 dB. Defaults to the peak power
+            ``max(x) ** 2``, which makes the loudest value 0 dB.
+
+    Returns:
+        Real-valued dB array with the same shape as `x`. An empty input is
+        returned unchanged, since a peak reference is undefined for it.
+    """
     power = x**2
     if power.size == 0:
         return power
@@ -117,7 +160,7 @@ def power_to_db(x: np.ndarray, ref: float | None = None) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def hann_window(win_length: int) -> np.ndarray:
-    """Build a periodic-endpoint Hann window.
+    """Build a symmetric Hann window.
 
     The window follows ``w[n] = 0.5 * (1 - cos(2*pi*n / (L - 1)))``, i.e. the
     symmetric form that touches zero at both ends.
@@ -613,6 +656,16 @@ def mfcc(
 
 
 def fft_frequencies(sample_rate: int, n_fft:int) -> np.ndarray:
+    """Return the centre frequency in Hz of every row of an `stft` output.
+
+    Args:
+        sample_rate: Sampling rate of the signal in Hz.
+        n_fft: FFT size used for the STFT.
+
+    Returns:
+        float32 array of shape ``(n_fft // 2 + 1,)``, evenly spaced from
+        0 Hz to the Nyquist frequency ``sample_rate / 2``.
+    """
     nyquist = sample_rate/2
     n_bins = n_fft//2 + 1 
 
@@ -621,6 +674,21 @@ def fft_frequencies(sample_rate: int, n_fft:int) -> np.ndarray:
     return frequencies.astype(np.float32)
 
 def octave_bands(sample_rate: int) -> np.ndarray:
+    """Return the edges of the octave bands used by `spectral_contrast`.
+
+    The first band is ``0..200`` Hz; every next edge doubles the last one
+    (400, 800, 1600, ...) until the Nyquist frequency, which closes the last
+    band. At 44.1 kHz that gives 9 edges, so 8 bands, the last one
+    ``12800..22050`` Hz.
+
+    Args:
+        sample_rate: Sampling rate of the signal in Hz.
+
+    Returns:
+        float32 array of increasing band edges in Hz, starting at 0 and
+        ending at ``sample_rate / 2``. Band `i` runs from ``edges[i]`` to
+        ``edges[i + 1]``.
+    """
     nyquist = sample_rate / 2
     
     edge = 200.0
@@ -641,7 +709,40 @@ def spectral_flatness(
         signal: np.ndarray, sample_rate: int, 
         edges: List[int|None]=(0, None),
         n_fft: int = 2048, hop_length: int = 512, min_share=0.01
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute the spectral flatness of each frequency band, frame by frame.
+
+    Flatness is the geometric mean of the power spectrum divided by its
+    arithmetic mean. It is close to 1 for noise-like sound (energy spread
+    evenly, e.g. a cymbal crash) and close to 0 for tonal sound (energy in
+    a few peaks, e.g. a ringing gong).
+
+    Args:
+        signal: 1-D real-valued audio samples.
+        sample_rate: Sampling rate of the signal in Hz.
+        edges: Band edges in Hz; band `i` covers ``edges[i] <= f < edges[i + 1]``.
+            ``None`` means the Nyquist frequency (included). The default
+            ``(0, None)`` is one band over the whole spectrum.
+        n_fft: FFT size. Must be a power of two.
+        hop_length: Samples advanced between consecutive frames.
+        min_share: Frames where a band holds less than this share of the
+            frame's total energy get NaN for that band, because flatness
+            means little there (e.g. a silent frame). `summarize_feature`
+            skips these frames.
+
+    Returns:
+        ``(flatness, share)``, each a float32 array of shape
+        ``(n_bands, n_frames)``: the flatness of every band, and the share
+        of the frame's energy in that band.
+
+    Steps:
+        1. Compute the STFT power spectrum and the frequency of every row.
+        2. Per band, keep the rows inside it and measure the band's share
+           of each frame's energy.
+        3. Divide the geometric by the arithmetic mean (powers floored at
+           1e-10, so the log stays finite).
+        4. Mark frames below `min_share` as NaN.
+    """
     P = complex_to_power(stft(signal, n_fft, hop_length))
     freqs = fft_frequencies(sample_rate, n_fft)
     edges = [e if e is not None else sample_rate/2 + 1 for e in edges]
@@ -660,6 +761,32 @@ def spectral_flatness(
 
 
 def spectral_contrast(signal: np.ndarray, sample_rate: int, n_fft: int, hop_length:int, quantile=0.02) -> np.ndarray:
+    """Compute the spectral contrast of each octave band, frame by frame.
+
+    Contrast is the difference in dB between the strongest and the weakest
+    frequencies in a band. A band with clear peaks (tonal) has a high
+    contrast; a band filled evenly (noise-like) has a low one.
+
+    Args:
+        signal: 1-D real-valued audio samples.
+        sample_rate: Sampling rate of the signal in Hz.
+        n_fft: FFT size. Must be a power of two.
+        hop_length: Samples advanced between consecutive frames.
+        quantile: Share of a band's frequency bins averaged for the peak
+            (the loudest bins) and for the valley (the quietest bins). At
+            least one bin is always used.
+
+    Returns:
+        float32 array of shape ``(n_bands, n_frames)``, one row per band of
+        `octave_bands` (8 rows at 44.1 kHz).
+
+    Steps:
+        1. Compute the STFT magnitude and the frequency of every row.
+        2. Per octave band, sort each frame's bins by magnitude.
+        3. Average the top `quantile` of bins (peak) and the bottom
+           `quantile` (valley).
+        4. Convert both with `magnitude_to_db` and subtract.
+    """
     P = complex_to_magnitude(stft(signal, n_fft, hop_length))
     frequencies = fft_frequencies(sample_rate, n_fft)
     edges = octave_bands(sample_rate)
@@ -673,7 +800,7 @@ def spectral_contrast(signal: np.ndarray, sample_rate: int, n_fft: int, hop_leng
         peak = np.mean((sorted_bins[-q:]), axis=0)
         valley = np.mean(sorted_bins[:q], axis=0)
 
-        contrast_value = magnitude_to_db(peak) - magnitude_to_db(valley)
+        contrast_value = magnitude_to_db(peak, 1.0) - magnitude_to_db(valley, 1.0)
 
         contrast.append(contrast_value)
 
@@ -683,9 +810,6 @@ def spectral_contrast(signal: np.ndarray, sample_rate: int, n_fft: int, hop_leng
 # ---------------------------------------------------------------------------
 # Feature vectors for the classifiers
 # ---------------------------------------------------------------------------
-
-AUGMENTATION_NAMES: Tuple[str, ...] = ("noise", "mp3", "downsample")
-
 
 def feature_names() -> List[str]:
     """Names of the columns produced by `extract_features`, in order."""
@@ -735,8 +859,8 @@ def extract_all_features(dataset: Dataset, desc: str = "Extracting") -> Features
         desc: Label for the progress bar.
 
     Returns:
-        `Features` with one row per clip, plus the clips' labels, names and
-        sources.
+        `Features` with one row per clip, plus the clips' labels, names,
+        sources and augmentation values.
 
     Raises:
         ValueError: If a clip produces NaN or infinite features (e.g. a
@@ -755,35 +879,64 @@ def extract_all_features(dataset: Dataset, desc: str = "Extracting") -> Features
         raise ValueError(f"{int(bad.sum())} clip(s) have NaN/inf features, e.g. "
                          f"'{dataset.names[first]}' in {shown}")
 
+    params = np.empty(len(dataset), dtype=object)
+    params[:] = dataset.params
     return Features(X, np.asarray(dataset.labels), np.asarray(dataset.names),
-                    np.asarray(dataset.sources), names)
+                    np.asarray(dataset.sources), params, names)
 
 
-def run_extraction(prepare: bool = True) -> Tuple[Dict[str, Features], ...]:
+def run_extraction(prepare: bool = True, data:dict | None = None) -> Tuple[Dict, ...]:
     """Extract features for the original clips and every augmentation.
 
     Args:
         prepare: If True, run `prepare_data` first (reuses the saved split,
             rebuilds the augmented files, about 50 s). If False, read the
             files a previous `prepare_data` run left on disk with `load_split`.
+            Ignored when `data` is given.
+        data: Clips that are already loaded, as
+            ``{"train": train, "test": test}`` with the dicts `prepare_data`
+            returns, e.g. after trimming and clipping them with
+            `preprocessing.clip_datasets`. ``None`` loads them as `prepare`
+            says. Neither way of loading clips the signals by itself.
 
     Returns:
         ``(original, noise, mp3, downsample)``. Each is a dict with a
-        ``"train"`` and a ``"test"`` `Features`, e.g.::
+        ``"train"`` and a ``"test"`` entry:
+
+        - ``original["train"]``, ``original["test"]``: `Features`.
+        - ``noise["train"]`` (and mp3, downsample): one `Features` with every
+          training copy; their values are random per clip.
+        - ``noise["test"]`` (and mp3, downsample): a dict with one `Features`
+          per fixed test level, e.g. ``noise["test"][30]`` holds every test
+          clip at 30 dB SNR, ``mp3["test"][9]`` at VBR quality 9 and
+          ``downsample["test"][8000]`` at 8 kHz.
+
+        Example::
 
             original, noise, mp3, downsample = run_extraction()
             model.fit(original["train"].X, original["train"].labels)
-            y_pred = model.predict(noise["test"].X)     # predict noisy test clips
+            for snr, test in noise["test"].items():
+                accuracy = np.mean(model.predict(test.X) == test.labels)
+                print(f"noise {snr} dB: {accuracy:.3f}")
     """
-    if prepare:
-        train, test = prepare_data()
-        data = {"train": train, "test": test}
-    else:
-        data = {split: {"original": load_split(split),
-                        **{name: load_split(split, [name], include_original=False)
-                           for name in AUGMENTATION_NAMES}}
-                for split in ("train", "test")}
+    if data is None:
+        if prepare:
+            train, test = prepare_data()
+            data = {"train": train, "test": test}
+        else:
+            data = {"train": {"original": load_split("train"),
+                            **{name: load_split("train", [name], include_original=False)
+                                for name in AUGMENTATION_NAMES}},
+                    "test": {"original": load_split("test"),
+                            **{name: load_split("test", [name], include_original=False).by_param()
+                                for name in AUGMENTATION_NAMES}}}
 
-    return tuple({split: extract_all_features(data[split][name], desc=f"{name} ({split})")
-                  for split in ("train", "test")}
-                 for name in ("original", *AUGMENTATION_NAMES))
+
+    original = {split: extract_all_features(data[split]["original"], desc=f"original ({split})")
+                for split in ("train", "test")}
+    augmented = [{"train": extract_all_features(data["train"][name], desc=f"{name} (train)"),
+                  "test": {level: extract_all_features(clips, desc=f"{name} {level} (test)")
+                           for level, clips in data["test"][name].items()}}
+                 for name in AUGMENTATION_NAMES]
+
+    return (original, *augmented)
