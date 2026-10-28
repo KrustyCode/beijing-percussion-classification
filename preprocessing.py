@@ -101,7 +101,8 @@ from config import (
     MANIFEST_PATH,
     SCALER_PATH,
     AUGMENTATION_NAMES,
-    MAX_DURATION
+    MAX_DURATION,
+    HOP_LENGTH
 )
 
 SPLITS: Tuple[str, str] = ("train", "test")
@@ -340,6 +341,27 @@ def clip_all(data_sequence: List, sample_rate: int = SAMPLE_RATE, max_duration: 
         ValueError: If `max_duration` is ``None``.
     """
     return [clip_duration(s, sample_rate, max_duration=max_duration) for s in data_sequence]
+
+def align_to_onset(signal: np.ndarray, sample_rate: int = SAMPLE_RATE, hop_length: int = HOP_LENGTH) -> np.ndarray:
+    onsets = lb.onset.onset_detect(y=signal, sr=sample_rate, hop_length=hop_length,
+                                   units="samples", backtrack=True)
+    if len(onsets) == 0:
+        return signal
+    return signal[onsets[0]:]
+
+def align_onset_all(data_sequence: List, sample_rate: int = SAMPLE_RATE, hop_length: int = HOP_LENGTH) -> List:
+    return [align_to_onset(s, sample_rate, hop_length) for s in data_sequence]
+
+def align_onset_datasets(datasets:dict, sample_rate: int = SAMPLE_RATE, hop_length: int = HOP_LENGTH):
+    for split in SPLITS:
+        datasets[split]["original"].signals = align_onset_all(datasets[split]["original"].signals, sample_rate, hop_length)
+        for name in AUGMENTATION_NAMES:
+            sets = datasets[split][name]
+            # train: one Dataset; test: {level: Dataset}
+            for dataset in (sets.values() if isinstance(sets, dict) else [sets]):
+                dataset.signals = clip_all(dataset.signals, sample_rate, hop_length)
+
+    return datasets
 
 
 def clip_datasets(datasets: dict, max_duration: float) -> dict:
@@ -932,11 +954,14 @@ def prepare_data(
             result[split][augmentation.name] = copies.by_param() if split == "test" else copies
             rows.extend(aug_rows)
 
-    # 3. TRIM AND CLIP EACH SPLIT (in memory only)
+    # 3. Align onset
+    result = align_onset_datasets(result)
+
+    # 4. TRIM AND CLIP EACH SPLIT (in memory only)
     if not max_duration is None:
         result = clip_datasets(result, max_duration)
 
-    # 4. MANIFEST
+    # 5. MANIFEST
     write_manifest(rows, manifest_path)
     print(f"Wrote {len(rows)} entries to {manifest_path}")
 
