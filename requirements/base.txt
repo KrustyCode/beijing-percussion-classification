@@ -1,0 +1,7 @@
+# Shared core: what config.py, preprocessing.py, feature_extraction.py and
+# model.py need. Both the backend and model development install this.
+numpy==2.4.6
+librosa==0.11.0
+soundfile==0.14.0
+scikit-learn==1.9.1
+tqdm==4.70.1
