@@ -30,6 +30,7 @@ from abc import ABC, abstractmethod
 from itertools import combinations
 from pathlib import Path
 from typing import Callable, Dict, Literal, Tuple
+from preprocessing import fit_scaler, z_score_standardization
 
 import numpy as np
 
@@ -170,7 +171,7 @@ class KNN(Model):
 
         self.X = X
         self.y = y
-        print("Model ready to be used for prediction!!!")
+        # print("Model ready to be used for prediction!!!")
         return self
 
     def _predict_one(self, a: np.ndarray):
@@ -571,7 +572,7 @@ class SVM(Model):
                 tolerance=self.tolerance, max_iteration=self.max_iteration,
             ).fit(X[in_pair], y[in_pair])
 
-        print("Model ready to be used for prediction!!!")
+        # print("Model ready to be used for prediction!!!")
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -635,3 +636,17 @@ def load_model(file_name: str = "model", folder: Path = MODEL_FOLDER_PATH) -> Mo
     """
     with open(Path(folder) / f"{file_name}.pkl", 'rb') as file:
         return pickle.load(file)
+
+
+class Standardized(Model):
+    def __init__(self, model:Model):
+        self.model = model
+        self.mean = self.std = None
+
+    def fit(self, X: np.ndarray, y:np.ndarray):
+        self.mean,self.std = fit_scaler(X)
+        self.model.fit(z_score_standardization(X, self.mean, self.std), y)
+        return self
+
+    def predict(self, X):
+        return self.model.predict(z_score_standardization(X, self.mean, self.std))

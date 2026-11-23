@@ -45,7 +45,7 @@ LABEL: List[str] = ["daluo", "bangu", "xiaoluo", "naobo"]
 # `preprocessing.clip_all`; `prepare_data` only clips when it is given a
 # `max_duration`, e.g. ``prepare_data(max_duration=MAX_DURATION)``.
 DURATIONS: List[float] = [0.5, 1.0, 1.5, 2.0, 2.5]
-MAX_DURATION: float | None = 2.0
+MAX_DURATION: float | None = None
 
 # ---------------------------------------------------------------------------
 # Augmentation settings

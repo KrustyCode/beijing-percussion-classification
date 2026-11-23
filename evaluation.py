@@ -44,7 +44,7 @@ from preprocessing import Dataset, clip_all
 from feature_extraction import extract_all_features
 from IPython.display import display
 
-from model import Model
+from model import Model, Standardized
 
 
 def confusion_matrix(predictions: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -330,6 +330,7 @@ def grid_search(
             my_model = model(random_state=random_state, **combination)
         else:
             my_model = model(**combination)
+        my_model = Standardized(model=my_model)
         mean, _ = stratified_k_fold_cross_validation(my_model, X, y, k, groups, random_state)
         if best_accuracy < mean:
             best_params = combination
