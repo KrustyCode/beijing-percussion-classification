@@ -359,7 +359,7 @@ def align_onset_datasets(datasets:dict, sample_rate: int = SAMPLE_RATE, hop_leng
             sets = datasets[split][name]
             # train: one Dataset; test: {level: Dataset}
             for dataset in (sets.values() if isinstance(sets, dict) else [sets]):
-                dataset.signals = clip_all(dataset.signals, sample_rate, hop_length)
+                dataset.signals = align_onset_all(dataset.signals, sample_rate, hop_length)
 
     return datasets
 
